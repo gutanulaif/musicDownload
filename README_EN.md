@@ -17,6 +17,10 @@
  
 </p>
 
+The Ultimate Music Downloader: Supports lossless audio downloads, batch downloading, one-click downloads, and playlist downloads.
+
+Enables music search and downloading from major streaming platforms—including Kugou, Kuwo, QQ Music, NetEase Cloud Music, Migu, and others—with full support for downloading lossless audio files.
+
 Based on the [musicdl](https://github.com/CharlesPikachu/musicdl) project, modified from the [musicdlgui.py](https://github.com/CharlesPikachu/musicdl/blob/master/examples/musicdlgui/musicdlgui.py) file, and then optimized the interface and functionality using AI tools.
 
 ### Screenshots:
@@ -39,7 +43,7 @@ Based on the [musicdl](https://github.com/CharlesPikachu/musicdl) project, modif
   </tr>
 </table>
 
-### Example：
+### Run Example：
 
 ```bash
 # Using Python3.13
@@ -50,6 +54,23 @@ gqb313\Script\Activate.bat
 cd musicDownload
 pip install -r requirements.txt
 python musicdownload.py 
+```
 
+### Run Release Example：
 
+```
+# Using Python3.13
+git clone https://github.com/MrsEWE44/musicDownload.git
+cd musicDownload
+python -m venv gqb313
+gqb313\Script\Activate.bat
+cd musicDownload
+pip install -r requirements.txt
+
+# If You Is Windows , Run make_release.bat
+.\make_release.bat
+
+# If You Is Linux、MacOS , Run make_release.sh
+bash make_release.sh
+```
 
