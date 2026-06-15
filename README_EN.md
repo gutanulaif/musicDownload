@@ -23,6 +23,32 @@ Enables music search and downloading from major streaming platforms—including 
 
 Based on the [musicdl](https://github.com/CharlesPikachu/musicdl) project, modified from the [musicdlgui.py](https://github.com/CharlesPikachu/musicdl/blob/master/examples/musicdlgui/musicdlgui.py) file, and then optimized the interface and functionality using AI tools.
 
+### What's New (v2.0)
+
+#### 🎯 Search Experience
+- **Interruptible Search**: Cancel search anytime; results already fetched are preserved
+- **Concurrent Search**: Multiple music sources searched simultaneously for faster results
+- **Real-time Progress**: Live progress updates showing completed sources
+
+#### 🎵 Sample Rate Display
+- New "Sample Rate" column in search results
+- Auto-detect sample rate for each track (44.1kHz / 48kHz / 96kHz etc.)
+- Identify Hi-Res audio at a glance
+
+#### ⚙️ Settings Persistence
+- **Music Sources**: Remembers your last source selection
+- **Results Per Source**: Remembers your search limit setting
+- **Download Directory**: Remembers your last save location
+
+#### 🎨 UI Improvements
+- Toast notifications replace popup dialogs — no more focus stealing
+- Search/download completion messages won't interrupt your workflow
+
+#### 📦 Packaging
+- Auto-detect and bundle ffprobe — no manual installation needed
+- Cross-platform support: Windows / Linux / macOS
+
+
 ### Screenshots:
 
 <table align="center" border="0" cellpadding="10">
@@ -43,34 +69,63 @@ Based on the [musicdl](https://github.com/CharlesPikachu/musicdl) project, modif
   </tr>
 </table>
 
-### Run Example：
+### Quick Start:
 
 ```bash
-# Using Python3.13
+# Requires Python 3.13+
 git clone https://github.com/MrsEWE44/musicDownload.git
 cd musicDownload
 python -m venv gqb313
+# Windows
 gqb313\Script\Activate.bat
-cd musicDownload
+# Linux/macOS
+source gqb313/bin/activate
+
 pip install -r requirements.txt
 python musicdownload.py 
 ```
 
-### Run Release Example：
+### Build Release:
 
-```
-# Using Python3.13
+```bash
+# Requires Python 3.13+
 git clone https://github.com/MrsEWE44/musicDownload.git
 cd musicDownload
 python -m venv gqb313
+# Windows
 gqb313\Script\Activate.bat
-cd musicDownload
+# Linux/macOS
+source gqb313/bin/activate
+
 pip install -r requirements.txt
 
-# If You Is Windows , Run make_release.bat
+# Windows
 .\make_release.bat
 
-# If You Is Linux、MacOS , Run make_release.sh
+# Linux/macOS
 bash make_release.sh
 ```
+
+#### Bundling ffprobe (Optional)
+
+The build script auto-detects and bundles ffprobe:
+
+- **Linux/macOS**: Automatically copies from system (`/usr/bin/ffprobe`)
+- **Windows**: Download `ffprobe.exe` and place in project directory
+
+Download from: https://github.com/BtbN/FFmpeg-Builds/releases
+Get `ffmpeg-master-latest-win64-gpl.zip`, extract and copy `ffprobe.exe` to project folder.
+
+
+### Changelog
+
+#### 2026-06-15
+- ✅ Interruptible search with partial results
+- ✅ Concurrent multi-source search
+- ✅ Sample rate detection and display
+- ✅ Music source selection persistence
+- ✅ Search limit persistence
+- ✅ Toast notifications (no focus stealing)
+- ✅ Auto-bundle ffprobe
+- ✅ Debug/Release versions share same codebase
 

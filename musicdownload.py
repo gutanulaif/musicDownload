@@ -1,7 +1,9 @@
 import sys
 import os
 import re
+import json
 import shutil
+import subprocess
 import requests
 from PySide6.QtWidgets import (
     QApplication,
@@ -55,6 +57,51 @@ except ImportError:
 
 def sanitize_filename(filename):
     return re.sub(r'[\\/*?:"<>|]', "_", str(filename))
+
+
+class ToastLabel(QLabel):
+    """主窗口内的 Toast 通知标签"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("""
+            QLabel {
+                background-color: rgba(50, 50, 50, 220);
+                color: white;
+                padding: 12px 24px;
+                border-radius: 8px;
+                font-size: 11pt;
+            }
+        """)
+        self.hide()
+
+    def show_toast(self, text, duration=3000):
+        self.setText(text)
+        self.adjustSize()
+        self._center_in_parent()
+        self.show()
+        self.raise_()
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(duration, self.hide)
+
+    def _center_in_parent(self):
+        if self.parent():
+            p = self.parent()
+            x = (p.width() - self.width()) // 2
+            y = (p.height() - self.height()) // 2
+            self.move(x, y)
+
+
+def show_message(parent, icon, title, text):
+    """显示不抢焦点的 Toast"""
+    icons = {
+        QMessageBox.Icon.Information: "ℹ️",
+        QMessageBox.Icon.Warning: "⚠️",
+        QMessageBox.Icon.Critical: "❌",
+    }
+    prefix = icons.get(icon, "")
+    if hasattr(parent, '_toast'):
+        parent._toast.show_toast(f"{prefix} {text}")
 
 
 class NumericTableItem(QTableWidgetItem):
@@ -192,28 +239,200 @@ class ImageDownloadTask(QRunnable):
             self.signals.error.emit(self.row)
 
 
+# ================= 采样率检测任务 =================
+def find_ffprobe():
+    """查找 ffprobe 可执行文件，按优先级搜索多个位置"""
+    # PyInstaller 打包后的临时目录
+    if getattr(sys, 'frozen', False):
+        bundle_dir = sys._MEIPASS
+        for name in ["ffprobe", "ffprobe.exe"]:
+            path = os.path.join(bundle_dir, name)
+            if os.path.isfile(path):
+                return path
+
+    # 脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    for name in ["ffprobe", "ffprobe.exe"]:
+        path = os.path.join(script_dir, name)
+        if os.path.isfile(path):
+            return path
+
+    # 脚本同级的 bin 目录
+    for name in ["ffprobe", "ffprobe.exe"]:
+        path = os.path.join(script_dir, "bin", name)
+        if os.path.isfile(path):
+            return path
+
+    # 系统 PATH
+    import shutil
+    path = shutil.which("ffprobe")
+    if path:
+        return path
+
+    return None
+
+
+class SampleRateWorkerSignals(QObject):
+    finished = Signal(int, str)  # row, 采样率文本
+    error = Signal(int)
+
+
+class SampleRateDetectTask(QRunnable):
+    """通过 ffprobe 检测下载 URL 的采样率"""
+
+    def __init__(self, row, download_url):
+        super().__init__()
+        self.row = row
+        self.download_url = download_url
+        self.signals = SampleRateWorkerSignals()
+
+    def run(self):
+        try:
+            ffprobe_path = find_ffprobe()
+            if not ffprobe_path:
+                self.signals.error.emit(self.row)
+                return
+            if not self.download_url or not str(self.download_url).startswith("http"):
+                self.signals.error.emit(self.row)
+                return
+            result = subprocess.run(
+                [
+                    ffprobe_path, "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_streams", "-select_streams", "a:0",
+                    str(self.download_url),
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                self.signals.error.emit(self.row)
+                return
+            info = json.loads(result.stdout)
+            streams = info.get("streams", [])
+            if streams:
+                sr = streams[0].get("sample_rate", "")
+                if sr:
+                    sr_khz = int(sr) / 1000
+                    self.signals.finished.emit(self.row, f"{sr_khz:.0f} kHz")
+                    return
+            self.signals.error.emit(self.row)
+        except Exception:
+            self.signals.error.emit(self.row)
+
+
 # ================= 后台搜索与下载线程 =================
 class SearchThread(QThread):
-    finished = Signal(dict)
+    finished = Signal(dict)       # 全部完成
+    partial = Signal(dict, str)   # 部分完成 (当前结果, 刚完成的源名称)
     error = Signal(str)
+    progress = Signal(str)        # 进度消息
 
-    def __init__(self, music_client, keyword, search_type):
+    def __init__(self, music_client, keyword, search_type, source_map_en_to_cn=None):
         super().__init__()
         self.music_client = music_client
         self.keyword = keyword
         self.search_type = search_type
+        self._cancelled = False
+        self._source_map_en_to_cn = source_map_en_to_cn or {}
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
         try:
             if self.search_type == "搜索歌曲":
-                results = self.music_client.search(keyword=self.keyword)
+                self._search_concurrent()
             else:
                 results = self.music_client.parseplaylist(self.keyword)
                 if not isinstance(results, dict):
                     results = {"歌单": results}
-            self.finished.emit(results)
+                self.finished.emit(results)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self._cancelled:
+                self.error.emit(str(e))
+
+    def _search_concurrent(self):
+        """并发搜索所有音乐源，支持中途取消"""
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        import time
+        from datetime import datetime
+
+        all_results = {}
+        lock = threading.Lock()
+        sources = list(self.music_client.music_clients.keys())
+        total = len(sources)
+        completed_count = [0]
+
+        # 恢复 musicdl 风格的日志输出，用作信息块分隔
+        source_names = "|".join(sources)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        print(f"{ts} - musicdl - INFO - Searching \033[93m{self.keyword}\033[0m From \033[93m{source_names}\033[0m")
+
+        self.progress.emit(f"正在并发搜索 {total} 个音乐源...")
+
+        def search_one_source(source):
+            if self._cancelled:
+                return source, []
+            try:
+                result = self.music_client.music_clients[source].search(
+                    keyword=self.keyword,
+                    num_threadings=self.music_client.clients_threadings.get(source, 1),
+                    request_overrides=self.music_client.requests_overrides.get(source, {}),
+                    rule=self.music_client.search_rules.get(source, None),
+                )
+                return source, result or []
+            except Exception as e:
+                print(f"搜索 {source} 失败: {e}")
+                return source, []
+
+        # 一次性提交所有源，轮询检查完成状态
+        # 注意：不用 with 语句，因为 __exit__ 会等待所有线程完成
+        executor = ThreadPoolExecutor(max_workers=min(total, 10))
+        try:
+            futures = {
+                executor.submit(search_one_source, src): src
+                for src in sources
+            }
+            pending = set(futures.keys())
+
+            while pending and not self._cancelled:
+                # 非阻塞轮询：检查哪些 future 已完成
+                done = [f for f in pending if f.done()]
+                if not done:
+                    time.sleep(0.1)  # 没有完成的，短暂等待后继续检查
+                    continue
+
+                for future in done:
+                    pending.discard(future)
+                    source = futures[future]
+                    source_cn = self._source_map_en_to_cn.get(source, source)
+
+                    try:
+                        source, result = future.result(timeout=0)
+                    except Exception as e:
+                        print(f"搜索 {source} 异常: {e}")
+                        result = []
+
+                    # 日志
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                    count = len(result) if result else 0
+                    print(f"{ts} - musicdl - INFO - {source}.search >>> Completed ({completed_count[0]+1}/{total}) Search URLs, got {count} results")
+
+                    if result:
+                        with lock:
+                            all_results[source] = result
+                            completed_count[0] += 1
+                            self.partial.emit(
+                                dict(all_results),
+                                f"{source_cn} ({completed_count[0]}/{total})",
+                            )
+
+            # 取消或正常完成
+            self.finished.emit(all_results)
+        finally:
+            # 不等待，直接关闭
+            executor.shutdown(wait=False)
 
 
 class DownloadThread(QThread):
@@ -291,10 +510,10 @@ class DownloadThread(QThread):
 
 
 class SimpleProgressDialog(QDialog):
-    def __init__(self, title, message, save_dir=None, parent=None):
+    def __init__(self, title, message, save_dir=None, parent=None, cancellable=False):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setFixedSize(360, 130)
+        self.setFixedWidth(360)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setStyleSheet("""
@@ -309,10 +528,10 @@ class SimpleProgressDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(10)
 
-        label = QLabel(message)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("font-size: 11pt; color: #1f2937; font-weight: bold;")
-        layout.addWidget(label)
+        self.label = QLabel(message)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("font-size: 11pt; color: #1f2937; font-weight: bold;")
+        layout.addWidget(self.label)
 
         if save_dir:
             dir_label = QLabel(f"保存到：{save_dir}")
@@ -321,13 +540,47 @@ class SimpleProgressDialog(QDialog):
             dir_label.setWordWrap(True)
             layout.addWidget(dir_label)
 
-        progress = QProgressBar()
-        progress.setRange(0, 0)
-        progress.setStyleSheet("""
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setStyleSheet("""
             QProgressBar { border: none; border-radius: 4px; background-color: #f3f4f6; height: 6px; }
             QProgressBar::chunk { background-color: #0078d4; border-radius: 4px; }
         """)
-        layout.addWidget(progress)
+        layout.addWidget(self.progress)
+
+        # 取消按钮
+        self.cancel_btn = None
+        self._cancelled = False
+        if cancellable:
+            self.cancel_btn = QPushButton("取消")
+            self.cancel_btn.setFixedWidth(80)
+            self.cancel_btn.setStyleSheet("""
+                QPushButton { background-color: #6b7280; color: white; font-size: 9pt; padding: 4px 12px; }
+                QPushButton:hover { background-color: #4b5563; }
+            """)
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            btn_layout.addWidget(self.cancel_btn)
+            btn_layout.addStretch()
+            layout.addLayout(btn_layout)
+
+        # 根据内容自适应高度
+        self.adjustSize()
+        self.setFixedHeight(self.sizeHint().height())
+
+    def set_message(self, text):
+        """更新提示文本"""
+        self.label.setText(text)
+
+    def set_cancelled(self):
+        """标记为已取消"""
+        self._cancelled = True
+        if self.cancel_btn:
+            self.cancel_btn.setEnabled(False)
+            self.cancel_btn.setText("已取消")
+
+    def is_cancelled(self):
+        return self._cancelled
 
 
 class FlowLayout(QLayout):
@@ -490,6 +743,16 @@ class MusicDownloader(QMainWindow):
             self.save_dir = os.path.join(self.current_dir, "已下载音乐")
         os.makedirs(self.save_dir, exist_ok=True)
 
+        # 加载已保存的音乐源选择
+        saved_sources = self.settings.value("selected_sources", "")
+        if saved_sources:
+            self.saved_sources = [s for s in saved_sources.split(",") if s]
+        else:
+            self.saved_sources = ["酷我音乐", "酷狗音乐"]
+
+        # 加载已保存的单源获取数量
+        self.saved_limit = int(self.settings.value("search_limit", 10))
+
         self.auto_download_after_search = False
 
         central = QWidget()
@@ -502,10 +765,11 @@ class MusicDownloader(QMainWindow):
         self.setup_top(main_layout)
         self.setup_table(main_layout)
 
+        # 初始化 Toast 通知
+        self._toast = ToastLabel(self)
+
         if not MUSICDL_AVAILABLE:
-            QMessageBox.warning(
-                self, "警告", "musicdl 库未安装！\n请运行: pip install musicdl"
-            )
+            show_message(self, QMessageBox.Icon.Warning, "警告", "musicdl 库未安装！\n请运行: pip install musicdl")
 
     def get_modern_style(self):
         # 样式表太长省略部分重复内容，保留核心
@@ -549,11 +813,11 @@ class MusicDownloader(QMainWindow):
         group = QGroupBox("选择音乐源")
         flow = FlowLayout()
         self.source_checkboxes = []
-        default_checked = ["酷我音乐", "酷狗音乐"]
         for cn_name in self.source_map_cn_to_en.keys():
             cb = QCheckBox(cn_name)
-            if cn_name in default_checked:
+            if cn_name in self.saved_sources:
                 cb.setChecked(True)
+            cb.stateChanged.connect(self._on_source_checkbox_changed)
             self.source_checkboxes.append(cb)
             flow.addWidget(cb)
         group.setLayout(flow)
@@ -563,9 +827,10 @@ class MusicDownloader(QMainWindow):
         label_limit = QLabel("单源获取数量：")
         self.spin_limit = ModernSpinBox()
         self.spin_limit.setRange(1, 100)
-        self.spin_limit.setValue(10)
+        self.spin_limit.setValue(self.saved_limit)
         self.spin_limit.setSuffix(" 条")
         self.spin_limit.setFixedWidth(100)
+        self.spin_limit.valueChanged.connect(self._on_limit_changed)
 
         label_save = QLabel("保存目录：")
         self.save_dir_edit = QLineEdit(self.save_dir)
@@ -630,7 +895,7 @@ class MusicDownloader(QMainWindow):
         layout.addLayout(batch)
 
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(9)
+        self.results_table.setColumnCount(10)
         self.results_table.setHorizontalHeaderLabels(
             [
                 "选择",
@@ -639,6 +904,7 @@ class MusicDownloader(QMainWindow):
                 "歌手",
                 "专辑",
                 "格式",
+                "采样率",
                 "大小",
                 "时长",
                 "来源",
@@ -665,7 +931,8 @@ class MusicDownloader(QMainWindow):
         self.results_table.setColumnWidth(4, 200)
         self.results_table.setColumnWidth(5, 60)
         self.results_table.setColumnWidth(6, 80)
-        self.results_table.setColumnWidth(7, 70)
+        self.results_table.setColumnWidth(7, 80)
+        self.results_table.setColumnWidth(8, 70)
         self.results_table.verticalHeader().setDefaultSectionSize(54)
 
         self.results_table.setSortingEnabled(True)
@@ -770,6 +1037,17 @@ class MusicDownloader(QMainWindow):
             self.save_dir_edit.setText(dir_path)
             self.settings.setValue("save_dir", dir_path)
 
+    def _on_source_checkbox_changed(self, state):
+        """音乐源选择变化时保存到配置"""
+        selected = [
+            cb.text() for cb in self.source_checkboxes if cb.isChecked()
+        ]
+        self.settings.setValue("selected_sources", ",".join(selected))
+
+    def _on_limit_changed(self, value):
+        """单源获取数量变化时保存到配置"""
+        self.settings.setValue("search_limit", value)
+
     def init_music_client(self):
         if not MUSICDL_AVAILABLE:
             return None
@@ -779,7 +1057,7 @@ class MusicDownloader(QMainWindow):
 
         src_names = self.get_selected_sources()
         if not src_names:
-            QMessageBox.warning(self, "提示", "请至少选择一个音乐来源！")
+            show_message(self, QMessageBox.Icon.Warning, "提示", "请至少选择一个音乐来源！")
             return None
 
         cfg = {
@@ -796,7 +1074,7 @@ class MusicDownloader(QMainWindow):
                 )
             return None
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"初始化 musicdl 客户端失败：{str(e)}")
+            show_message(self, QMessageBox.Icon.Critical, "错误", f"初始化 musicdl 客户端失败：{str(e)}")
             return None
 
     def get_selected_sources(self):
@@ -874,13 +1152,14 @@ class MusicDownloader(QMainWindow):
                     (3, str(singers)),
                     (4, str(album)),
                     (5, self.get_file_format(per_source_search_result)),
-                    (6, str(per_source_search_result.get("file_size", ""))),
-                    (7, str(per_source_search_result.get("duration", ""))),
-                    (8, str(source_cn)),
+                    (6, "检测中..."),  # 采样率，异步检测后填充
+                    (7, str(per_source_search_result.get("file_size", ""))),
+                    (8, str(per_source_search_result.get("duration", ""))),
+                    (9, str(source_cn)),
                 ]
 
                 for column, text in columns_data:
-                    if column in (6, 7):
+                    if column in (7, 8):
                         table_item = NumericTableItem(text)
                         table_item.setData(
                             Qt.ItemDataRole.UserRole,
@@ -897,6 +1176,14 @@ class MusicDownloader(QMainWindow):
                     self.results_table.setItem(row, column, table_item)
 
                 self.music_records[str(row)] = per_source_search_result
+
+                # 提交采样率检测任务
+                download_url = per_source_search_result.get("download_url", "")
+                if download_url:
+                    task = SampleRateDetectTask(row, download_url)
+                    task.signals.finished.connect(self.on_samplerate_detected)
+                    task.signals.error.connect(self.on_samplerate_error)
+                    self.thread_pool.start(task)
 
                 # [优化 1] 将图片下载投递到线程池，而不是直接 new QThread
                 album_image_url = self.get_album_image_url(per_source_search_result)
@@ -916,11 +1203,7 @@ class MusicDownloader(QMainWindow):
         if self.auto_download_after_search and all_songs:
             self._start_download_task(all_songs, f"正在处理 {len(all_songs)} 首歌曲")
         else:
-            QMessageBox.information(
-                self,
-                "搜索完毕",
-                f"🎉 搜索完成！共找到 {row} 首歌曲。\n(专辑封面正在后台加载...)",
-            )
+            show_message(self, QMessageBox.Icon.Information, "搜索完毕", f"🎉 搜索完成！共找到 {row} 首歌曲。\n(专辑封面正在后台加载...)")
 
     def _start_download_task(self, songs_list, msg):
         """[优化] 提取出公共的下载弹窗逻辑"""
@@ -933,15 +1216,11 @@ class MusicDownloader(QMainWindow):
 
         def on_finished(success_count):
             dlg.accept()
-            QMessageBox.information(
-                self,
-                "下载完成",
-                f"✅ 成功提取 {success_count} 首歌曲！\n已保存在：{self.save_dir}",
-            )
+            show_message(self, QMessageBox.Icon.Information, "下载完成", f"✅ 成功提取 {success_count} 首歌曲！\n已保存在：{self.save_dir}")
 
         def on_error(error_msg):
             dlg.accept()
-            QMessageBox.critical(self, "错误", f"❌ 下载失败：{error_msg}")
+            show_message(self, QMessageBox.Icon.Critical, "错误", f"❌ 下载失败：{error_msg}")
 
         self.download_thread.finished.connect(on_finished)
         self.download_thread.error.connect(on_error)
@@ -965,6 +1244,26 @@ class MusicDownloader(QMainWindow):
             self.results_table.setCellWidget(row, 1, label)
         except Exception as e:
             print(f"设置专辑封面失败: {e}")
+
+    def on_samplerate_detected(self, row, sr_text):
+        try:
+            item = QTableWidgetItem(sr_text)
+            item.setTextAlignment(
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
+            )
+            self.results_table.setItem(row, 6, item)
+        except Exception as e:
+            print(f"设置采样率失败: {e}")
+
+    def on_samplerate_error(self, row):
+        try:
+            item = QTableWidgetItem("-")
+            item.setTextAlignment(
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
+            )
+            self.results_table.setItem(row, 6, item)
+        except Exception as e:
+            print(f"设置采样率失败: {e}")
 
     def get_songs_by_download_scope(self):
         scope = self.combo_download_scope.currentText()
@@ -992,7 +1291,7 @@ class MusicDownloader(QMainWindow):
     def on_search(self):
         keyword = self.search_edit.text().strip()
         if not keyword:
-            QMessageBox.warning(self, "提示", "请输入你要搜索的关键词！")
+            show_message(self, QMessageBox.Icon.Warning, "提示", "请输入你要搜索的关键词！")
             return
 
         self.music_client = self.init_music_client()
@@ -1004,26 +1303,48 @@ class MusicDownloader(QMainWindow):
         self.btn_search.setText("搜索中...")
 
         dlg = SimpleProgressDialog(
-            "🔍 搜索中", "正在全网搜罗音乐，请稍候...", None, self
+            "🔍 搜索中", "正在全网搜罗音乐，请稍候...", None, self,
+            cancellable=True,
         )
         dlg.show()
 
         self.search_thread = SearchThread(
-            self.music_client, keyword, self.search_mode.currentText()
+            self.music_client, keyword, self.search_mode.currentText(),
+            source_map_en_to_cn=self.source_map_en_to_cn,
         )
+
+        def on_cancel():
+            dlg.set_cancelled()
+            dlg.set_message("正在取消搜索...")
+            self.search_thread.cancel()
+
+        dlg.cancel_btn.clicked.connect(on_cancel)
+
+        def on_progress(msg):
+            if not dlg.is_cancelled():
+                dlg.set_message(msg)
+
+        def on_partial(results, source_name):
+            """部分搜索完成，实时更新表格"""
+            if not dlg.is_cancelled():
+                source_cn = self.source_map_en_to_cn.get(source_name, source_name)
+                dlg.set_message(f"已完成 {source_cn}，继续搜索中...")
 
         def on_finished(results):
             dlg.accept()
             self.btn_search.setEnabled(True)
             self.btn_search.setText("🔍 立即搜索")
-            self.load_table_with_results(results)
+            if results:
+                self.load_table_with_results(results)
 
         def on_error(error_msg):
             dlg.accept()
             self.btn_search.setEnabled(True)
             self.btn_search.setText("🔍 立即搜索")
-            QMessageBox.critical(self, "错误", f"搜索失败：{error_msg}")
+            show_message(self, QMessageBox.Icon.Critical, "错误", f"搜索失败：{error_msg}")
 
+        self.search_thread.progress.connect(on_progress)
+        self.search_thread.partial.connect(on_partial)
         self.search_thread.finished.connect(on_finished)
         self.search_thread.error.connect(on_error)
         self.search_thread.start()
@@ -1033,7 +1354,7 @@ class MusicDownloader(QMainWindow):
             return
         songs_to_download = self.get_songs_by_download_scope()
         if not songs_to_download:
-            QMessageBox.warning(self, "提示", "没有符合条件的歌曲，请检查是否已勾选！")
+            show_message(self, QMessageBox.Icon.Warning, "提示", "没有符合条件的歌曲，请检查是否已勾选！")
             return
 
         reply = QMessageBox.question(
