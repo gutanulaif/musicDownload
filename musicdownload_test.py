@@ -39,6 +39,7 @@ from PySide6.QtCore import (
     QThreadPool,
     QRunnable,
     QObject,
+    QSettings,
 )
 from PySide6.QtGui import QPixmap, QFont, QColor, QPainter, QAction
 
@@ -481,7 +482,12 @@ class MusicDownloader(QMainWindow):
         self.thread_pool.setMaxThreadCount(10)
 
         self.current_dir = os.getcwd()
-        self.save_dir = os.path.join(self.current_dir, "已下载音乐")
+        self.settings = QSettings("musicDownload", "MusicDownloader")
+        saved = self.settings.value("save_dir", "")
+        if saved and os.path.isdir(saved):
+            self.save_dir = saved
+        else:
+            self.save_dir = os.path.join(self.current_dir, "已下载音乐")
         os.makedirs(self.save_dir, exist_ok=True)
 
         self.auto_download_after_search = False
@@ -762,6 +768,7 @@ class MusicDownloader(QMainWindow):
         if dir_path:
             self.save_dir = dir_path
             self.save_dir_edit.setText(dir_path)
+            self.settings.setValue("save_dir", dir_path)
 
     def init_music_client(self):
         if not MUSICDL_AVAILABLE:
