@@ -1,4 +1,3 @@
 requests
-PyQt5
-musicdl
 PySide6
+musicdl
