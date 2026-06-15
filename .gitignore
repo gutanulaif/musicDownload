@@ -1,4 +1,10 @@
 /.musicdl_temp
 /build
 /dist
-/*.specCLAUDE.md
+/*.spec
+__pycache__/
+*.pyc
+ffprobe
+ffprobe.exe
+musicdl_outputs/
+CLAUDE.md
