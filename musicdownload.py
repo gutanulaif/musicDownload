@@ -296,6 +296,38 @@ def find_ffprobe():
     return None
 
 
+def find_ffmpeg():
+    """查找 ffmpeg 可执行文件，按优先级搜索多个位置"""
+    # PyInstaller 打包后的临时目录
+    if getattr(sys, 'frozen', False):
+        bundle_dir = sys._MEIPASS
+        for name in ["ffmpeg", "ffmpeg.exe"]:
+            path = os.path.join(bundle_dir, name)
+            if os.path.isfile(path):
+                return path
+
+    # 脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    for name in ["ffmpeg", "ffmpeg.exe"]:
+        path = os.path.join(script_dir, name)
+        if os.path.isfile(path):
+            return path
+
+    # 脚本同级的 bin 目录
+    for name in ["ffmpeg", "ffmpeg.exe"]:
+        path = os.path.join(script_dir, "bin", name)
+        if os.path.isfile(path):
+            return path
+
+    # 系统 PATH
+    import shutil
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+
+    return None
+
+
 class SampleRateWorkerSignals(QObject):
     finished = Signal(int, str)  # row, 采样率文本
     error = Signal(int)
@@ -342,6 +374,52 @@ class SampleRateDetectTask(QRunnable):
             self.signals.error.emit(self.row)
         except Exception:
             self.signals.error.emit(self.row)
+
+
+# ================= 响度检测任务 =================
+class LoudnessWorkerSignals(QObject):
+    finished = Signal(str, float)  # url, integrated loudness (LUFS)
+    error = Signal(str)
+
+
+class LoudnessDetectTask(QRunnable):
+    """通过 ffmpeg 检测音频的 Integrated Loudness (LUFS)"""
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.signals = LoudnessWorkerSignals()
+
+    def run(self):
+        try:
+            ffmpeg_path = find_ffmpeg()
+            if not ffmpeg_path or not self.url:
+                self.signals.error.emit(self.url)
+                return
+            # 只分析前30秒，加快检测速度
+            result = subprocess.run(
+                [
+                    ffmpeg_path, "-v", "quiet",
+                    "-t", "30",
+                    "-i", str(self.url),
+                    "-af", "ebur128=framelog=quiet",
+                    "-f", "null", "-"
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            # 从 stderr 中解析 Integrated Loudness
+            for line in result.stderr.split("\n"):
+                if "Integrated loudness" in line and ":" in line:
+                    # 格式: "    Integrated loudness: I:         -14.3 LUFS"
+                    parts = line.split(":")
+                    if len(parts) >= 2:
+                        lufs_str = parts[-1].strip().split()[0]
+                        lufs = float(lufs_str)
+                        self.signals.finished.emit(self.url, lufs)
+                        return
+            self.signals.error.emit(self.url)
+        except Exception:
+            self.signals.error.emit(self.url)
 
 
 # ================= 后台搜索与下载线程 =================
@@ -861,10 +939,19 @@ class ModernDialog(QDialog):
 class AudioPlayerWidget(QWidget):
     """底部在线播放器控件"""
 
-    def __init__(self, parent=None):
+    # 目标响度 (LUFS)，Spotify 标准为 -14，EBU R128 为 -23
+    TARGET_LUFS = -14.0
+
+    def __init__(self, parent=None, settings=None):
         super().__init__(parent)
         self._slider_pressed = False
         self._current_title = ""
+        self._current_url = ""
+        self._settings = settings
+        self._thread_pool = QThreadPool()
+        self._thread_pool.setMaxThreadCount(2)
+        self._loudness_cache = {}  # url -> lufs
+        self._base_volume = 70  # 用户设置的基础音量
         # 防止播放器在垂直方向扩展
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(56)
@@ -935,7 +1022,9 @@ class AudioPlayerWidget(QWidget):
         self.mute_btn.setFixedSize(34, 34)
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(70)
+        # 加载保存的音量，默认70
+        saved_volume = int(self._settings.value("volume", 70)) if self._settings else 70
+        self.volume_slider.setValue(saved_volume)
         self.volume_slider.setFixedWidth(90)
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
         self.mute_btn.clicked.connect(self._on_mute_toggle)
@@ -1020,7 +1109,8 @@ class AudioPlayerWidget(QWidget):
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
-        self.audio_output.setVolume(0.7)
+        # 使用滑块的初始值设置音量
+        self.audio_output.setVolume(self.volume_slider.value() / 100.0)
 
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
@@ -1030,11 +1120,50 @@ class AudioPlayerWidget(QWidget):
     def play_url(self, url, title=""):
         """加载并播放指定 URL"""
         self._current_title = title
+        self._current_url = url
         if title:
             self.title_label.setText(title)
             self.title_label.setToolTip(title)
         self.player.setSource(QUrl(url))
         self.player.play()
+        # 异步检测响度并均衡音量
+        self._detect_and_normalize_loudness(url)
+
+    def _detect_and_normalize_loudness(self, url):
+        """检测音频响度并自动调整播放音量"""
+        if not url or not str(url).startswith("http"):
+            return
+        # 如果已缓存，直接应用
+        if url in self._loudness_cache:
+            self._apply_loudness_gain(self._loudness_cache[url])
+            return
+        # 异步检测
+        task = LoudnessDetectTask(url)
+        task.signals.finished.connect(self._on_loudness_detected)
+        task.signals.error.connect(self._on_loudness_error)
+        self._thread_pool.start(task)
+
+    def _on_loudness_detected(self, url, lufs):
+        """响度检测完成，缓存并应用增益"""
+        self._loudness_cache[url] = lufs
+        self._apply_loudness_gain(lufs)
+
+    def _on_loudness_error(self, url):
+        """响度检测失败，不做调整"""
+        pass
+
+    def _apply_loudness_gain(self, measured_lufs):
+        """根据实测响度和目标响度，计算并应用音量增益"""
+        # 计算增益差值：目标响度 - 实测响度
+        gain_db = self.TARGET_LUFS - measured_lufs
+        # 将 dB 转换为线性增益 (0.0 ~ 2.0 范围内)
+        import math
+        gain_linear = 10 ** (gain_db / 20.0)
+        gain_linear = max(0.1, min(2.0, gain_linear))  # 限制范围
+        # 应用增益：用户设置的基础音量 × 增益系数
+        final_volume = (self._base_volume / 100.0) * gain_linear
+        final_volume = max(0.0, min(1.0, final_volume))
+        self.audio_output.setVolume(final_volume)
 
     def _on_play_pause(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -1080,7 +1209,16 @@ class AudioPlayerWidget(QWidget):
             self.play_btn.setIcon(self._colorize_icon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)))
 
     def _on_volume_changed(self, value):
-        self.audio_output.setVolume(value / 100.0)
+        # 更新基础音量
+        self._base_volume = value
+        # 如果有缓存的响度，应用均衡；否则直接设置
+        if self._loudness_cache and self._current_url in self._loudness_cache:
+            self._apply_loudness_gain(self._loudness_cache[self._current_url])
+        else:
+            self.audio_output.setVolume(value / 100.0)
+        # 保存音量设置
+        if self._settings:
+            self._settings.setValue("volume", value)
 
     def _on_mute_toggle(self):
         muted = self.audio_output.isMuted()
@@ -1173,7 +1311,7 @@ class MusicDownloader(QMainWindow):
         self.setup_table(main_layout)
 
         # 底部播放器
-        self.audio_player = AudioPlayerWidget(self)
+        self.audio_player = AudioPlayerWidget(self, self.settings)
         main_layout.addWidget(self.audio_player)
 
         # 初始化 Toast 通知
@@ -1274,8 +1412,6 @@ class MusicDownloader(QMainWindow):
             background: #ffffff;
             alternate-background-color: #f8fafc;
             color: #334155;
-            selection-background-color: #ccfbf1;
-            selection-color: #0f172a;
             outline: none;
             font-size: 10pt;
         }
@@ -1289,6 +1425,7 @@ class MusicDownloader(QMainWindow):
             padding: 8px 10px;
         }
         QTableWidget::item { padding: 3px; border-bottom: 1px solid #f1f5f9; }
+        QTableWidget::item:selected { background-color: #ccfbf1; color: #0f172a; }
 
         /* ===== 滚动条 ===== */
         QScrollBar:vertical {
@@ -1721,6 +1858,7 @@ class MusicDownloader(QMainWindow):
             for per_source_search_result in per_source_search_results:
                 # Checkbox
                 w = QWidget()
+                w.setStyleSheet("background: transparent;")
                 lay = QHBoxLayout(w)
                 checkbox = QCheckBox()
                 # attach song_info to checkbox so it stays with the widget when the table is sorted
@@ -1816,7 +1954,7 @@ class MusicDownloader(QMainWindow):
             label = QLabel()
             label.setPixmap(pixmap)
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setStyleSheet("border-radius: 3px;")
+            label.setStyleSheet("background: transparent; border-radius: 3px;")
             self.results_table.setCellWidget(row, 1, label)
         except Exception as e:
             print(f"设置专辑封面失败: {e}")
@@ -1825,7 +1963,7 @@ class MusicDownloader(QMainWindow):
         try:
             label = QLabel("🎵")
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setStyleSheet("font-size: 20px; color: #d1d5db;")
+            label.setStyleSheet("background: transparent; font-size: 20px; color: #d1d5db;")
             self.results_table.setCellWidget(row, 1, label)
         except Exception as e:
             print(f"设置专辑封面失败: {e}")
