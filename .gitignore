@@ -8,3 +8,4 @@ ffprobe
 ffprobe.exe
 musicdl_outputs/
 CLAUDE.md
+test_loudness.py
