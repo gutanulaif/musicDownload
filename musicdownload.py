@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QCheckBox,
-    QComboBox,
     QSpinBox,
     QProgressBar,
     QTableWidget,
@@ -154,35 +153,6 @@ def extract_numeric_value(text):
 
 
 # ================= 自定义现代 UI 组件 (保留原样) =================
-class ModernComboBox(QComboBox):
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QColor("#6b7280"))
-        font = self.font()
-        font.setPixelSize(10)
-        painter.setFont(font)
-        rect = self.rect()
-        painter.drawText(
-            rect.adjusted(0, 0, -10, 0),
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            "▼",
-        )
-        painter.end()
-
-    def showPopup(self):
-        super().showPopup()
-        popup = self.view()
-        # 根据内容自适应宽度（最宽项 + 左右 padding）
-        max_width = self.width()
-        for i in range(self.count()):
-            text_width = self.fontMetrics().horizontalAdvance(self.itemText(i)) + 40
-            max_width = max(max_width, text_width)
-        popup.setFixedWidth(max_width)
-        # 高度紧贴内容
-        popup.setFixedHeight(popup.sizeHint().height())
-
 
 class ModernSpinBox(QSpinBox):
     def paintEvent(self, event):
@@ -296,38 +266,6 @@ def find_ffprobe():
     return None
 
 
-def find_ffmpeg():
-    """查找 ffmpeg 可执行文件，按优先级搜索多个位置"""
-    # PyInstaller 打包后的临时目录
-    if getattr(sys, 'frozen', False):
-        bundle_dir = sys._MEIPASS
-        for name in ["ffmpeg", "ffmpeg.exe"]:
-            path = os.path.join(bundle_dir, name)
-            if os.path.isfile(path):
-                return path
-
-    # 脚本所在目录
-    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-    for name in ["ffmpeg", "ffmpeg.exe"]:
-        path = os.path.join(script_dir, name)
-        if os.path.isfile(path):
-            return path
-
-    # 脚本同级的 bin 目录
-    for name in ["ffmpeg", "ffmpeg.exe"]:
-        path = os.path.join(script_dir, "bin", name)
-        if os.path.isfile(path):
-            return path
-
-    # 系统 PATH
-    import shutil
-    path = shutil.which("ffmpeg")
-    if path:
-        return path
-
-    return None
-
-
 class SampleRateWorkerSignals(QObject):
     finished = Signal(int, str)  # row, 采样率文本
     error = Signal(int)
@@ -359,6 +297,7 @@ class SampleRateDetectTask(QRunnable):
                     str(self.download_url),
                 ],
                 capture_output=True, text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             if result.returncode != 0:
                 self.signals.error.emit(self.row)
@@ -374,52 +313,6 @@ class SampleRateDetectTask(QRunnable):
             self.signals.error.emit(self.row)
         except Exception:
             self.signals.error.emit(self.row)
-
-
-# ================= 响度检测任务 =================
-class LoudnessWorkerSignals(QObject):
-    finished = Signal(str, float)  # url, integrated loudness (LUFS)
-    error = Signal(str)
-
-
-class LoudnessDetectTask(QRunnable):
-    """通过 ffmpeg 检测音频的 Integrated Loudness (LUFS)"""
-
-    def __init__(self, url):
-        super().__init__()
-        self.url = url
-        self.signals = LoudnessWorkerSignals()
-
-    def run(self):
-        try:
-            ffmpeg_path = find_ffmpeg()
-            if not ffmpeg_path or not self.url:
-                self.signals.error.emit(self.url)
-                return
-            # 只分析前30秒，加快检测速度
-            result = subprocess.run(
-                [
-                    ffmpeg_path, "-v", "quiet",
-                    "-t", "30",
-                    "-i", str(self.url),
-                    "-af", "ebur128=framelog=quiet",
-                    "-f", "null", "-"
-                ],
-                capture_output=True, text=True, timeout=30,
-            )
-            # 从 stderr 中解析 Integrated Loudness
-            for line in result.stderr.split("\n"):
-                if "Integrated loudness" in line and ":" in line:
-                    # 格式: "    Integrated loudness: I:         -14.3 LUFS"
-                    parts = line.split(":")
-                    if len(parts) >= 2:
-                        lufs_str = parts[-1].strip().split()[0]
-                        lufs = float(lufs_str)
-                        self.signals.finished.emit(self.url, lufs)
-                        return
-            self.signals.error.emit(self.url)
-        except Exception:
-            self.signals.error.emit(self.url)
 
 
 # ================= 后台搜索与下载线程 =================
@@ -939,19 +832,11 @@ class ModernDialog(QDialog):
 class AudioPlayerWidget(QWidget):
     """底部在线播放器控件"""
 
-    # 目标响度 (LUFS)，Spotify 标准为 -14，EBU R128 为 -23
-    TARGET_LUFS = -14.0
-
     def __init__(self, parent=None, settings=None):
         super().__init__(parent)
         self._slider_pressed = False
         self._current_title = ""
-        self._current_url = ""
         self._settings = settings
-        self._thread_pool = QThreadPool()
-        self._thread_pool.setMaxThreadCount(2)
-        self._loudness_cache = {}  # url -> lufs
-        self._base_volume = 70  # 用户设置的基础音量
         # 防止播放器在垂直方向扩展
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(56)
@@ -1120,50 +1005,11 @@ class AudioPlayerWidget(QWidget):
     def play_url(self, url, title=""):
         """加载并播放指定 URL"""
         self._current_title = title
-        self._current_url = url
         if title:
             self.title_label.setText(title)
             self.title_label.setToolTip(title)
         self.player.setSource(QUrl(url))
         self.player.play()
-        # 异步检测响度并均衡音量
-        self._detect_and_normalize_loudness(url)
-
-    def _detect_and_normalize_loudness(self, url):
-        """检测音频响度并自动调整播放音量"""
-        if not url or not str(url).startswith("http"):
-            return
-        # 如果已缓存，直接应用
-        if url in self._loudness_cache:
-            self._apply_loudness_gain(self._loudness_cache[url])
-            return
-        # 异步检测
-        task = LoudnessDetectTask(url)
-        task.signals.finished.connect(self._on_loudness_detected)
-        task.signals.error.connect(self._on_loudness_error)
-        self._thread_pool.start(task)
-
-    def _on_loudness_detected(self, url, lufs):
-        """响度检测完成，缓存并应用增益"""
-        self._loudness_cache[url] = lufs
-        self._apply_loudness_gain(lufs)
-
-    def _on_loudness_error(self, url):
-        """响度检测失败，不做调整"""
-        pass
-
-    def _apply_loudness_gain(self, measured_lufs):
-        """根据实测响度和目标响度，计算并应用音量增益"""
-        # 计算增益差值：目标响度 - 实测响度
-        gain_db = self.TARGET_LUFS - measured_lufs
-        # 将 dB 转换为线性增益 (0.0 ~ 2.0 范围内)
-        import math
-        gain_linear = 10 ** (gain_db / 20.0)
-        gain_linear = max(0.1, min(2.0, gain_linear))  # 限制范围
-        # 应用增益：用户设置的基础音量 × 增益系数
-        final_volume = (self._base_volume / 100.0) * gain_linear
-        final_volume = max(0.0, min(1.0, final_volume))
-        self.audio_output.setVolume(final_volume)
 
     def _on_play_pause(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -1209,13 +1055,7 @@ class AudioPlayerWidget(QWidget):
             self.play_btn.setIcon(self._colorize_icon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)))
 
     def _on_volume_changed(self, value):
-        # 更新基础音量
-        self._base_volume = value
-        # 如果有缓存的响度，应用均衡；否则直接设置
-        if self._loudness_cache and self._current_url in self._loudness_cache:
-            self._apply_loudness_gain(self._loudness_cache[self._current_url])
-        else:
-            self.audio_output.setVolume(value / 100.0)
+        self.audio_output.setVolume(value / 100.0)
         # 保存音量设置
         if self._settings:
             self._settings.setValue("volume", value)
@@ -1282,7 +1122,9 @@ class MusicDownloader(QMainWindow):
         self.thread_pool.setMaxThreadCount(10)
 
         self.current_dir = os.getcwd()
-        self.settings = QSettings("musicDownload", "MusicDownloader")
+        # 使用 INI 文件存储设置，便于便携部署
+        settings_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "settings.ini")
+        self.settings = QSettings(settings_path, QSettings.Format.IniFormat)
         saved = self.settings.value("save_dir", "")
         if saved and os.path.isdir(saved):
             self.save_dir = saved
@@ -1348,8 +1190,8 @@ class MusicDownloader(QMainWindow):
             border-color: #14b8a6;
         }
 
-        /* ===== 输入框 / 下拉框 / 微调框 ===== */
-        QLineEdit, ModernComboBox, ModernSpinBox {
+        /* ===== 输入框 / 微调框 ===== */
+        QLineEdit, ModernSpinBox {
             border: 1px solid #e2e8f0;
             border-radius: 8px;
             padding: 5px 12px;
@@ -1358,23 +1200,9 @@ class MusicDownloader(QMainWindow):
             color: #0f172a;
             font-size: 10pt;
         }
-        QLineEdit:focus, ModernComboBox:focus, ModernSpinBox:focus {
+        QLineEdit:focus, ModernSpinBox:focus {
             border: 2px solid #14b8a6;
             padding: 4px 11px;
-        }
-        ModernComboBox::drop-down { width: 26px; border: none; background: transparent; }
-        ModernComboBox::down-arrow { image: none; }
-        ModernComboBox QAbstractItemView {
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            background-color: #ffffff;
-            selection-background-color: #ccfbf1;
-            selection-color: #0f172a;
-            outline: none; padding: 4px;
-            min-width: 140px;
-        }
-        ModernComboBox QAbstractItemView::item {
-            min-height: 32px; border-radius: 4px; padding: 4px 12px;
         }
         ModernSpinBox { padding-right: 24px; }
         ModernSpinBox::up-button, ModernSpinBox::down-button {
